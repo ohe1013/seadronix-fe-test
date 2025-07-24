@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Muxed A/V Streaming</title>
+    <style>
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      #controls {
+        margin: 10px;
+      }
+      #videoCanvas {
+        background: #000;
+      }
+      /* Canvas 픽셀 보존을 위해 pixelated 모드 추가 */
+      canvas {
+        image-rendering: pixelated;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="controls">
+      <input
+        id="urlInput"
+        size="40"
+        value="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+      />
+      <button id="startBtn">시작</button>
+      &nbsp;|&nbsp;
+      <input id="seekInput" type="number" value="0" style="width: 60px" />
+      <button id="seekBtn">Seek</button>
+    </div>
+
+    <canvas id="videoCanvas"></canvas>
+    <script>
+      const urlInput = document.getElementById("urlInput");
+      const startBtn = document.getElementById("startBtn");
+      const seekInput = document.getElementById("seekInput");
+      const seekBtn = document.getElementById("seekBtn");
+      const canvas = document.getElementById("videoCanvas");
+      const ctx = canvas.getContext("2d");
+
+      let socket;
+      let firstServerTs = 0,
+        startLocal = 0,
+        startAudioTime = 0;
+      const frameQueue = [];
+      // --- Video State ---
+      let videoDecoder,
+        annexbBuffer = new Uint8Array(),
+        v_configured = false,
+        sps,
+        pps;
+
+      // --- Audio State ---
+      let audioDecoder,
+        a_configured = false;
+      const audioCtx = new AudioContext();
+      async function initDecoder(desc, spsNal) {
+        // SPS NAL에서 프로파일/레벨 파싱
+        const p = spsNal[1].toString(16).padStart(2, "0");
+        const c = spsNal[2].toString(16).padStart(2, "0");
+        const l = spsNal[3].toString(16).padStart(2, "0");
+        const codecId = `avc1.${p}${c}${l}`; // ex: avc1.640028
+
+        videoDecoder = new VideoDecoder({
+          output: handleFrame,
+          error: (e) => console.error(e),
+        });
+        videoDecoder.configure({ codec: codecId, description: desc });
+        console.log("▶ decoder configured:", codecId);
+      }
+      function createConfig(sps, pps) {
+        const spsLen = sps.byteLength,
+          ppsLen = pps.byteLength;
+        const desc = new Uint8Array(7 + 2 + spsLen + 1 + 2 + ppsLen);
+        let o = 0;
+        desc[o++] = 1;
+        desc[o++] = sps[1];
+        desc[o++] = sps[2];
+        desc[o++] = sps[3];
+        desc[o++] = 0xff;
+        desc[o++] = 0xe1;
+        desc[o++] = (spsLen >> 8) & 0xff;
+        desc[o++] = spsLen & 0xff;
+        desc.set(sps, o);
+        o += spsLen;
+        desc[o++] = 1;
+        desc[o++] = (ppsLen >> 8) & 0xff;
+        desc[o++] = ppsLen & 0xff;
+        desc.set(pps, o);
+        return desc;
+      }
+      let nextRenderTime = 0; // 다음 프레임을 언제 렌더할지
+      const ASSUMED_FPS = 30; // 영상의 FPS (30fps 가정)
+      const FRAME_INTERVAL = 1000 / ASSUMED_FPS; // ≒
+
+      // function renderLoop() {
+      //   const now = performance.now();
+
+      //   // 스케줄러 시작 직후 한 번 초기화
+      //   if (!nextRenderTime) {
+      //     nextRenderTime = now;
+      //   }
+
+      //   // 프레임 하나만 꺼내서 그리기
+      //   if (frameQueue.length && now >= nextRenderTime) {
+      //     const frame = frameQueue.shift();
+      //     canvas.width = frame.codedWidth;
+      //     canvas.height = frame.codedHeight;
+      //     ctx.drawImage(frame, 0, 0);
+      //     ctx.imageSmoothingEnabled = false;
+      //     const nowEpoch = performance.timeOrigin + performance.now();
+      //     const latencyMs = nowEpoch - frame.timestamp;
+
+      //     // 3) 오버레이 텍스트
+      //     ctx.font = "20px sans-serif";
+      //     ctx.fillStyle = "yellow";
+      //     ctx.textBaseline = "top";
+      //     ctx.fillText(`Latency: ${latencyMs.toFixed(1)} ms`, 10, 10);
+      //     frame.close();
+      //     // 다음 렌더 시점을 고정된 인터벌만큼 후로 미룸
+      //     nextRenderTime += FRAME_INTERVAL;
+      //   }
+
+      //   requestAnimationFrame(renderLoop);
+      // }
+
+      function renderLoop(now) {
+        if (!nextRenderTime) nextRenderTime = now;
+        if (frameQueue.length && now >= nextRenderTime) {
+          const frame = frameQueue.shift();
+          // 그리기
+          canvas.width = frame.codedWidth;
+          canvas.height = frame.codedHeight;
+          ctx.drawImage(frame, 0, 0);
+
+          // 레이턴시 계산: decodeLocal - recvLocal
+          const netDecodeMs = (frame.decodeLocal - frame.recvLocal).toFixed(1);
+          ctx.font = "20px sans-serif";
+          ctx.fillStyle = "yellow";
+          ctx.fillText(`Latency: ${netDecodeMs} ms`, 10, 10);
+
+          frame.close();
+          nextRenderTime += FRAME_INTERVAL;
+        }
+        requestAnimationFrame(renderLoop);
+      }
+      // ✨ 디코딩된 비디오 프레임 처리 (단순화)
+      // function handleFrame(frame) {
+      //   canvas.width = frame.codedWidth;
+      //   canvas.height = frame.codedHeight;
+      //   ctx.drawImage(frame, 0, 0);
+      //   ctx.imageSmoothingEnabled = false;
+      //   const nowEpoch = performance.timeOrigin + performance.now();
+      //   const e2e = (nowEpoch - frame.timestamp).toFixed(1);
+      //   ctx.font = "20px sans-serif";
+      //   ctx.fillStyle = "yellow";
+      //   ctx.fillText(`Latency: ${e2e} ms`, 10, 30);
+      //   frame.close();
+      // }
+      function handleFrame(frame) {
+        frameQueue.push(frame);
+      }
+      // ✨ 디코딩된 오디오 데이터 처리
+      function handleAudio(audioData) {
+        const mediaSec = (audioData.timestamp - firstServerTs) / 1000;
+        const playAt = startAudioTime + mediaSec;
+
+        const buffer = audioCtx.createBuffer(
+          audioData.numberOfChannels,
+          audioData.numberOfFrames,
+          audioData.sampleRate
+        );
+
+        for (let i = 0; i < audioData.numberOfChannels; i++) {
+          const channelData = new Float32Array(audioData.numberOfFrames);
+          audioData.copyTo(channelData, { planeIndex: i });
+          buffer.copyToChannel(channelData, i);
+        }
+
+        const srcNode = audioCtx.createBufferSource();
+        srcNode.buffer = buffer;
+        srcNode.connect(audioCtx.destination);
+
+        if (playAt < audioCtx.currentTime) srcNode.start(audioCtx.currentTime);
+        else srcNode.start(playAt);
+
+        audioData.close();
+      }
+      function isVideoChunk(ev) {
+        // 문자열(reset 등)과 구분
+        if (typeof ev.data === "string") return false;
+
+        const packet = new Uint8Array(ev.data);
+        const type = packet[0]; // 1: video, 2: audio
+        return type === 1;
+      }
+      // 디코더 초기화/리셋
+      function resetDecoders() {
+        if (videoDecoder && videoDecoder.state !== "closed") {
+          videoDecoder.close();
+          videoDecoder = undefined; // 인스턴스 재할당을 위해 null/undefined 처리
+        }
+        if (audioDecoder && audioDecoder.state !== "closed") {
+          audioDecoder.close();
+          audioDecoder = undefined;
+        }
+        annexbBuffer = new Uint8Array();
+        v_configured = a_configured = false;
+        sps = pps = undefined;
+      }
+
+      function connect() {
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        firstServerTs = 0;
+        resetDecoders();
+        socket?.close();
+
+        socket = new WebSocket(
+          `ws://${location.host}/stream?src=${encodeURIComponent(
+            urlInput.value
+          )}`
+        );
+        socket.binaryType = "arraybuffer";
+        socket.onopen = () => console.log("▶ WS open");
+        socket.onclose = () => console.log("▶ WS closed");
+        socket.onerror = (e) => console.error("▶ WS error", e);
+
+        socket.onmessage = async (ev) => {
+          // Seek 후 서버가 보낸 reset 메시지 처리
+
+          if (typeof ev.data === "string") {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg.type === "reset") {
+                console.log("▶ Client state reset by server");
+                resetDecoders();
+                return;
+              }
+            } catch (e) {}
+          }
+
+          const packet = new Uint8Array(ev.data);
+          const type = packet[0];
+          const serverTs = Number(
+            new DataView(packet.buffer, packet.byteOffset + 1, 8).getBigUint64(
+              0,
+              false
+            )
+          );
+          const body = packet.subarray(9);
+
+          if (type === 1) {
+            // 1) Annex‑B 버퍼에 누적
+            const combined = new Uint8Array(
+              annexbBuffer.byteLength + body.byteLength
+            );
+            combined.set(annexbBuffer, 0);
+            combined.set(body, annexbBuffer.byteLength);
+            annexbBuffer = combined;
+
+            // 2) start‑code 경계로 NAL 분리
+            const nalUnits = extractNALUnits(annexbBuffer);
+            // 마지막 단위는 미완성일 수 있으니 버퍼에 남겨 둠
+            annexbBuffer = nalUnits.pop() || new Uint8Array();
+
+            // 3) SPS/PPS 처리(초기 설정)
+            if (!v_configured) {
+              for (const nal of nalUnits) {
+                const nt = nal[0] & 0x1f;
+                if (nt === 7) sps = nal;
+                else if (nt === 8) pps = nal;
+              }
+              if (sps && pps) {
+                await initDecoder(createConfig(sps, pps), sps);
+                v_configured = true;
+              }
+              return;
+            }
+            if (!firstServerTs) {
+              firstServerTs = serverTs;
+              startLocal = performance.now();
+              console.log("▶ renderLoop 시작");
+              requestAnimationFrame(renderLoop);
+            }
+            // 4) length‑prefixing + decode
+            for (const nal of nalUnits) {
+              const nt = nal[0] & 0x1f;
+              // if (!(nt === 1 || nt === 5) || !v_configured) continue;
+              // // 큐가 지나치게 쌓이면 drop
+              // if (videoDecoder.decodeQueueSize > 2) {
+              //   console.warn(
+              //     "Dropping frame, queueSize=",
+              //     videoDecoder.decodeQueueSize
+              //   );
+              //   continue;
+              // }
+
+              // 4바이트 big‑endian 길이 헤더
+              const len = nal.byteLength;
+              const chunk = new Uint8Array(4 + len);
+              chunk[0] = (len >>> 24) & 0xff;
+              chunk[1] = (len >>> 16) & 0xff;
+              chunk[2] = (len >>> 8) & 0xff;
+              chunk[3] = len & 0xff;
+              chunk.set(nal, 4);
+
+              videoDecoder.decode(
+                new EncodedVideoChunk({
+                  type: nt === 5 ? "key" : "delta",
+                  timestamp: serverTs,
+                  data: chunk,
+                })
+              );
+            }
+          }
+          // else if (type === 2) {
+          //   // Audio
+          //   if (!a_configured) {
+          //     audioDecoder = new AudioDecoder({
+          //       output: handleAudio,
+          //       error: (e) => console.error(e),
+          //     });
+          //     // ✨ AAC-LC, 48kHz, Stereo로 가정. 실제로는 파싱 필요.
+          //     audioDecoder.configure({
+          //       codec: "mp4a.40.2",
+          //       sampleRate: 48000,
+          //       numberOfChannels: 2,
+          //     });
+          //     console.log("▶ AudioDecoder configured");
+          //     a_configured = true;
+          //   }
+
+          //   if (a_configured) {
+          //     audioDecoder.decode(
+          //       new EncodedAudioChunk({
+          //         type: "key",
+          //         timestamp: serverTs,
+          //         data: body,
+          //       })
+          //     );
+          //   }
+          // }
+        };
+      }
+
+      // AnnexB NAL 유닛 추출기 (안정성을 위해 수정)
+      function extractNALUnits(buf) {
+        const units = [];
+        let start = 0;
+        for (let i = 0; i + 3 < buf.length; i++) {
+          if (
+            buf[i] === 0 &&
+            buf[i + 1] === 0 &&
+            buf[i + 2] === 0 &&
+            buf[i + 3] === 1
+          ) {
+            if (i > start) units.push(buf.subarray(start, i));
+            start = i + 4;
+            i += 3;
+          }
+        }
+        if (start < buf.length) units.push(buf.subarray(start));
+        return units;
+      }
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          // 탭이 활성화됐을 때
+          nextRenderTime = performance.now();
+          requestAnimationFrame(renderLoop);
+        }
+      });
+      startBtn.onclick = connect;
+      seekBtn.onclick = () => {
+        const t = parseFloat(seekInput.value);
+        if (!isNaN(t) && socket?.readyState === WebSocket.OPEN) {
+          console.log("▶ send seek", t);
+          socket.send(JSON.stringify({ type: "seek", time: t }));
+        }
+      };
+    </script>
+  </body>
+</html>

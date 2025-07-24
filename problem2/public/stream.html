@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MSE + Latency Overlay</title>
+    <style>
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      #controls {
+        margin: 10px;
+      }
+      .video-container {
+        position: relative;
+        display: inline-block;
+      }
+      video {
+        display: block;
+        max-width: 100%;
+      }
+      .latency-overlay {
+        position: absolute;
+        top: 8px;
+        left: 8px;
+        padding: 2px 6px;
+        background: rgba(0, 0, 0, 0.6);
+        color: #0f0;
+        font: 14px monospace;
+        pointer-events: none;
+        z-index: 10;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="controls">
+      <input
+        id="urlInput"
+        size="60"
+        value="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+      />
+      <button id="startBtn">MSE 재생 시작</button>
+    </div>
+
+    <div class="video-container">
+      <video id="video" controls></video>
+      <span id="latencyOverlay" class="latency-overlay">-- ms</span>
+    </div>
+
+    <script>
+      const urlInput = document.getElementById("urlInput");
+      const startBtn = document.getElementById("startBtn");
+      const video = document.getElementById("video");
+      const overlay = document.getElementById("latencyOverlay");
+
+      let mediaSource, sourceBuffer, ws;
+      const appendQueue = [];
+      const removeQueue = [];
+      let firstServerTs = 0,
+        startLocal = 0;
+
+      startBtn.addEventListener("click", () => {
+        // 이전 연결/소스 정리
+        if (ws) ws.close();
+        video.pause();
+        URL.revokeObjectURL(video.src);
+
+        // MediaSource 생성
+        mediaSource = new MediaSource();
+        video.src = URL.createObjectURL(mediaSource);
+        mediaSource.addEventListener("sourceopen", onSourceOpen);
+      });
+
+      function onSourceOpen() {
+        mediaSource.removeEventListener("sourceopen", onSourceOpen);
+
+        // 1) SourceBuffer 생성
+        const mime = 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
+        sourceBuffer = mediaSource.addSourceBuffer(mime);
+        sourceBuffer.mode = "sequence";
+
+        // 2) WebSocket 연결
+        ws = new WebSocket(
+          `ws://${location.host}/stream?format=fmp4&src=${encodeURIComponent(
+            urlInput.value
+          )}`
+        );
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => console.log("▶ WS open");
+        ws.onerror = (e) => console.error("▶ WS error", e);
+
+        const KEEP_SEC = 10;
+
+        ws.onmessage = (ev) => {
+          // 1바이트 type + 8바이트 ts + fragment
+          const pkt = new Uint8Array(ev.data);
+          const serverTs = Number(
+            new DataView(pkt.buffer, 1, 8).getBigUint64(0, false)
+          );
+          const fragment = pkt.subarray(9);
+
+          // 타임스탬프 동기화
+          if (!firstServerTs) {
+            firstServerTs = serverTs;
+            startLocal = performance.now();
+          }
+
+          // 지연(ms) 계산 & 오버레이 갱신
+          const now = performance.now();
+          const latency = now - startLocal - (serverTs - firstServerTs);
+          overlay.textContent = `${Math.round(latency)} ms`;
+
+          // MSE 버퍼링 로직
+          appendQueue.push(fragment);
+          const buf = sourceBuffer.buffered;
+          if (buf.length && video.currentTime > KEEP_SEC) {
+            removeQueue.push({
+              start: 0,
+              end: video.currentTime - KEEP_SEC,
+            });
+          }
+        };
+
+        // 3) drain loop: remove → append 순서로 계속 처리
+        function drain() {
+          if (!sourceBuffer.updating) {
+            if (removeQueue.length) {
+              const { start, end } = removeQueue.shift();
+              sourceBuffer.remove(start, end);
+            } else if (appendQueue.length) {
+              try {
+                sourceBuffer.appendBuffer(appendQueue.shift());
+              } catch (e) {
+                console.error("appendBuffer failed:", e);
+              }
+            }
+          }
+          // 첫 프래그먼트 들어오면 자동 재생
+          if (video.paused && sourceBuffer.buffered.length > 0) {
+            video.play().catch(() => {});
+          }
+          requestAnimationFrame(drain);
+        }
+        requestAnimationFrame(drain);
+      }
+    </script>
+  </body>
+</html>
