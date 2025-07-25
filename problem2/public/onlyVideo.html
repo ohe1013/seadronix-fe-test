@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <title>WebSocket Seekable Streaming</title>
+    <style>
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      #controls {
+        margin: 8px;
+      }
+      #videoCanvas {
+        background: #000;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="controls">
+      <input
+        id="urlInput"
+        size="40"
+        value="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4"
+      />
+      <button id="startBtn">시작</button>
+      &nbsp;|&nbsp;
+      <input id="seekInput" type="number" value="0" style="width: 60px" />초
+      <button id="seekBtn">Seek</button>
+    </div>
+    <canvas id="videoCanvas"></canvas>
+
+    <script>
+      const urlInput = document.getElementById("urlInput");
+      const startBtn = document.getElementById("startBtn");
+      const seekInput = document.getElementById("seekInput");
+      const seekBtn = document.getElementById("seekBtn");
+      const canvas = document.getElementById("videoCanvas");
+      const ctx = canvas.getContext("2d");
+
+      let socket, decoder;
+      let annexbBuffer = new Uint8Array();
+      let configured = false,
+        sps,
+        pps;
+
+      // AVCDecoderConfigurationRecord 생성 (이전 코드와 동일)
+      function createConfig(sps, pps) {
+        const spsLen = sps.byteLength,
+          ppsLen = pps.byteLength;
+        const desc = new Uint8Array(7 + 2 + spsLen + 1 + 2 + ppsLen);
+        let o = 0;
+        desc[o++] = 1;
+        desc[o++] = sps[1];
+        desc[o++] = sps[2];
+        desc[o++] = sps[3];
+        desc[o++] = 0xff;
+        desc[o++] = 0xe1;
+        desc[o++] = (spsLen >> 8) & 0xff;
+        desc[o++] = spsLen & 0xff;
+        desc.set(sps, o);
+        o += spsLen;
+        desc[o++] = 1;
+        desc[o++] = (ppsLen >> 8) & 0xff;
+        desc[o++] = ppsLen & 0xff;
+        desc.set(pps, o);
+        return desc;
+      }
+
+      async function initDecoder(desc) {
+        decoder = new VideoDecoder({
+          output: (frame) => {
+            const now = performance.now();
+            const lat = (now - frame.timestamp).toFixed(1);
+            canvas.width = frame.codedWidth;
+            canvas.height = frame.codedHeight;
+            ctx.drawImage(frame, 0, 0);
+            ctx.font = "20px sans-serif";
+            ctx.fillStyle = "yellow";
+            ctx.fillText(`${lat} ms`, 10, 30);
+            frame.close();
+          },
+          error: (e) => console.error("Decoder error:", e),
+        });
+        decoder.configure({ codec: "avc1.42E01E", description: desc });
+        console.log("Decoder configured");
+      }
+
+      function resetDecoder() {
+        if (decoder && decoder.state !== "closed") {
+          decoder.close();
+          console.log("Decoder closed");
+        }
+        annexbBuffer = new Uint8Array();
+        configured = false;
+        sps = pps = undefined;
+      }
+
+      function connect() {
+        resetDecoder();
+        socket && socket.close();
+
+        const wsUrl = `ws://${location.host}/stream?src=${encodeURIComponent(
+          urlInput.value
+        )}`;
+        socket = new WebSocket(wsUrl);
+        socket.binaryType = "arraybuffer";
+
+        socket.addEventListener("open", () => console.log("WS open"));
+        socket.addEventListener("message", async (ev) => {
+          const chunk = new Uint8Array(ev.data);
+          // Annex‑B 누적
+          const tmp = new Uint8Array(
+            annexbBuffer.byteLength + chunk.byteLength
+          );
+          tmp.set(annexbBuffer, 0);
+          tmp.set(chunk, annexbBuffer.byteLength);
+          annexbBuffer = tmp;
+
+          // start‑code 인덱스
+          const idxs = [];
+          for (let i = 0; i + 3 < annexbBuffer.length; i++) {
+            if (
+              annexbBuffer[i] === 0 &&
+              annexbBuffer[i + 1] === 0 &&
+              annexbBuffer[i + 2] === 0 &&
+              annexbBuffer[i + 3] === 1
+            )
+              idxs.push(i);
+          }
+          // NAL 단위로 분리
+          for (let i = 0; i + 1 < idxs.length; i++) {
+            const nal = annexbBuffer.subarray(idxs[i] + 4, idxs[i + 1]);
+            const type = nal[0] & 0x1f;
+            if (!configured && (type === 7 || type === 8)) {
+              if (type === 7) {
+                sps = nal;
+                console.log("got SPS");
+              } else {
+                pps = nal;
+                console.log("got PPS");
+              }
+              if (sps && pps) {
+                await initDecoder(createConfig(sps, pps));
+                configured = true;
+              }
+              continue;
+            }
+            if (!configured) continue;
+
+            // slice(1)/IDR(5)만 처리
+            if (type !== 1 && type !== 5) continue;
+
+            // AVCC framing
+            const len = nal.byteLength;
+            const framed = new Uint8Array(4 + len);
+            framed[0] = (len >>> 24) & 0xff;
+            framed[1] = (len >>> 16) & 0xff;
+            framed[2] = (len >>> 8) & 0xff;
+            framed[3] = len & 0xff;
+            framed.set(nal, 4);
+
+            decoder.decode(
+              new EncodedVideoChunk({
+                type: type === 5 ? "key" : "delta",
+                timestamp: performance.now(),
+                data: framed,
+              })
+            );
+          }
+          // 남은 버퍼
+          if (idxs.length)
+            annexbBuffer = annexbBuffer.subarray(idxs[idxs.length - 1]);
+        });
+        socket.addEventListener("close", () => console.log("WS closed"));
+        socket.addEventListener("error", (e) => console.error("WS err:", e));
+      }
+
+      startBtn.onclick = connect;
+      seekBtn.onclick = () => {
+        const t = parseFloat(seekInput.value);
+        if (!isNaN(t) && socket?.readyState === WebSocket.OPEN) {
+          console.log("→ send seek", t);
+          socket.send(JSON.stringify({ type: "seek", time: t }));
+          resetDecoder();
+        }
+      };
+    </script>
+  </body>
+</html>

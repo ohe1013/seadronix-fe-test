@@ -22,7 +22,7 @@ const MIME = {
 // 1) HTTP 서버: public 폴더 정적 서빙
 const server = http.createServer((req, res) => {
   const urlPath =
-    req.url.split("?")[0] === "/" ? "/index.html" : req.url.split("?")[0];
+    req.url.split("?")[0] === "/" ? "/past.html" : req.url.split("?")[0];
   const fp = path.join(PUBLIC_DIR, urlPath);
   fs.stat(fp, (err, stat) => {
     if (err || !stat.isFile()) {
@@ -65,11 +65,53 @@ wss.on("connection", (ws, req) => {
     console.log(`Starting ffmpeg for ${src} at ${currentSeek}s`);
 
     // ✨ 하나의 FFmpeg 프로세스로 비디오와 오디오를 동시에 처리
+    // ff = spawn(
+    //   ffmpegBin,
+    //   [
+    //     "-ss",
+    //     `${currentSeek}`,
+    //     "-i",
+    //     src,
+    //     -"-copyts",
+    //     "-vsync",
+    //     "passthrough",
+    //     "-analyzeduration",
+    //     "0",
+    //     "-probesize",
+    //     "32",
+    //     "-fflags",
+    //     "nobuffer",
+    //     "-flags",
+    //     "low_delay",
+    //     "-tune",
+    //     "zerolatency",
+    //     "-flush_packets",
+    //     "1",
+    //     "-max_delay",
+    //     "0",
+    //     "-map",
+    //     "0:v:0",
+    //     "-c:v",
+    //     "copy",
+    //     "-bsf:v",
+    //     "h264_mp4toannexb,dump_extra",
+    //     "-f",
+    //     "h264",
+    //     "pipe:4",
+    //     "-map",
+    //     "0:a:0",
+    //     "-c:a",
+    //     "copy",
+    //     "-f",
+    //     "adts",
+    //     "pipe:5",
+    //   ],
+    //   { stdio: ["pipe", "pipe", "pipe", "pipe", "pipe", "pipe"] }
+    // );
     ff = spawn(
       ffmpegBin,
       [
         // ── 전역 / 입력 최적화
-        "-re",
         "-ss",
         `${currentSeek}`, // seek 지원,
         "-i",
@@ -100,7 +142,7 @@ wss.on("connection", (ws, req) => {
         "-c:v",
         "copy",
         "-bsf:v",
-        "h264_mp4toannexb,dump_extra",
+        "h264_mp4toannexb",
         "-f",
         "h264",
         "pipe:4",
@@ -109,11 +151,9 @@ wss.on("connection", (ws, req) => {
         "-map",
         "0:a:0",
         "-c:a",
-        "aac", // AAC 코덱으로 인코딩
-        "-b:a",
-        "128k", // 오디오 비트레이트 (예: 128kbps)
+        "copy",
         "-f",
-        "adts", // AAC ADTS (raw AAC stream with headers)
+        "adts",
         "pipe:5",
       ],
       {
@@ -127,12 +167,22 @@ wss.on("connection", (ws, req) => {
         ],
       }
     );
-
     const sendPacket = (type, chunk) => {
       if (ws.readyState !== ws.OPEN) return;
-      const tsBuf = Buffer.alloc(8);
-      tsBuf.writeBigUInt64BE(BigInt(Date.now()));
-      const header = Buffer.concat([Buffer.from([type]), tsBuf]);
+      // 1) 원본 PTS를 H.264 NAL Unit에서 파싱하거나,
+      //    ffmpeg 로그(-debug_ts)에서 가져와야 합니다.
+      //    여기선 예시로 0으로 두고, 나중에 적절히 채워 주세요.
+      const pts = 0; // in seconds
+
+      // 2) sendTime
+      const sendTime = Date.now(); // ms
+
+      // 3) 헤더: [type(1b)] [PTS(8b double64)] [sendTime(8b u64)]
+      const header = Buffer.alloc(1 + 8 + 8);
+      header.writeUInt8(type, 0);
+      header.writeDoubleBE(pts, 1);
+      header.writeBigUInt64BE(BigInt(sendTime), 1 + 8);
+
       ws.send(Buffer.concat([header, chunk]));
     };
 

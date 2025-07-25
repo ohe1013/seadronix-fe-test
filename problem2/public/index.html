@@ -139,11 +139,15 @@
           canvas.height = frame.codedHeight;
           ctx.drawImage(frame, 0, 0);
 
-          // 레이턴시 계산: decodeLocal - recvLocal
-          const netDecodeMs = (frame.decodeLocal - frame.recvLocal).toFixed(1);
-          ctx.font = "20px sans-serif";
-          ctx.fillStyle = "yellow";
-          ctx.fillText(`Latency: ${netDecodeMs} ms`, 10, 10);
+          // 지연 시간 계산: 렌더링 시간 - 패킷 수신 시간
+          if (frame.recvLocalTime) {
+            const latencyMs = (performance.now() - frame.recvLocalTime).toFixed(
+              1
+            );
+            ctx.font = "20px sans-serif";
+            ctx.fillStyle = "yellow";
+            ctx.fillText(`Latency: ${latencyMs} ms`, 10, 20);
+          }
 
           frame.close();
           nextRenderTime += FRAME_INTERVAL;
@@ -163,9 +167,28 @@
       //   ctx.fillText(`Latency: ${e2e} ms`, 10, 30);
       //   frame.close();
       // }
+      // function handleFrame(frame) {
+      //   // 디코딩 된 프레임에 마지막으로 수신된 패킷의 시간을 첨부
+      //   frame.recvLocalTime = lastPacketRecvTime;
+      //   frameQueue.push(frame);
+      // }
       function handleFrame(frame) {
-        frameQueue.push(frame);
+        // 캔버스 크기 업데이트
+        canvas.width = frame.codedWidth;
+        canvas.height = frame.codedHeight;
+
+        // 그리기
+        ctx.drawImage(frame, 0, 0);
+
+        // 지연 시간 표시
+        const latency = (performance.now() - frame.recvLocalTime).toFixed(1);
+        ctx.font = "20px sans-serif";
+        ctx.fillText(`Latency: ${latency} ms`, 10, 20);
+
+        // 메모리 해제
+        frame.close();
       }
+
       // ✨ 디코딩된 오디오 데이터 처리
       function handleAudio(audioData) {
         const mediaSec = (audioData.timestamp - firstServerTs) / 1000;
@@ -244,7 +267,9 @@
               }
             } catch (e) {}
           }
-
+          if (isVideoChunk(ev)) {
+            lastPacketRecvTime = performance.now();
+          }
           const packet = new Uint8Array(ev.data);
           const type = packet[0];
           const serverTs = Number(
@@ -286,7 +311,7 @@
               firstServerTs = serverTs;
               startLocal = performance.now();
               console.log("▶ renderLoop 시작");
-              requestAnimationFrame(renderLoop);
+              // requestAnimationFrame(renderLoop);
             }
             // 4) length‑prefixing + decode
             for (const nal of nalUnits) {
@@ -300,7 +325,6 @@
               //   );
               //   continue;
               // }
-
               // 4바이트 big‑endian 길이 헤더
               const len = nal.byteLength;
               const chunk = new Uint8Array(4 + len);
@@ -319,33 +343,6 @@
               );
             }
           }
-          // else if (type === 2) {
-          //   // Audio
-          //   if (!a_configured) {
-          //     audioDecoder = new AudioDecoder({
-          //       output: handleAudio,
-          //       error: (e) => console.error(e),
-          //     });
-          //     // ✨ AAC-LC, 48kHz, Stereo로 가정. 실제로는 파싱 필요.
-          //     audioDecoder.configure({
-          //       codec: "mp4a.40.2",
-          //       sampleRate: 48000,
-          //       numberOfChannels: 2,
-          //     });
-          //     console.log("▶ AudioDecoder configured");
-          //     a_configured = true;
-          //   }
-
-          //   if (a_configured) {
-          //     audioDecoder.decode(
-          //       new EncodedAudioChunk({
-          //         type: "key",
-          //         timestamp: serverTs,
-          //         data: body,
-          //       })
-          //     );
-          //   }
-          // }
         };
       }
 
@@ -372,7 +369,7 @@
         if (!document.hidden) {
           // 탭이 활성화됐을 때
           nextRenderTime = performance.now();
-          requestAnimationFrame(renderLoop);
+          // requestAnimationFrame(renderLoop);
         }
       });
       startBtn.onclick = connect;
